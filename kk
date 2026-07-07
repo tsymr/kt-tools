@@ -6,6 +6,8 @@ KUBECTL_BIN="${KUBECTL:-kubectl}"
 FZF_BIN="${FZF:-fzf}"
 PRINT_ONLY=0
 SKIP_PAUSE=0
+BACK_CHOICE=".. back"
+BACK_STATUS=10
 
 usage() {
   cat <<'EOF'
@@ -129,18 +131,95 @@ run_log_page() {
 
 fzf_select() {
   local prompt="$1"
+  local selection
+  local item display
+  local max_key_len="${#BACK_CHOICE}"
+  local -a rows=()
   shift
 
   if (($# == 0)); then
     return 1
   fi
 
-  printf '%s\n' "$@" | "$FZF_BIN" \
+  for item in "$@"; do
+    ((${#item} > max_key_len)) && max_key_len="${#item}"
+  done
+
+  printf -v display "%-${max_key_len}s  %s" "$BACK_CHOICE" "返回上一级菜单"
+  rows+=("$BACK_CHOICE"$'\t'"$display")
+  for item in "$@"; do
+    rows+=("$item"$'\t'"$item")
+  done
+
+  selection=$(printf '%s\n' "${rows[@]}" | "$FZF_BIN" \
     --height="${KK_FZF_HEIGHT:-70%}" \
     --layout=reverse \
     --border \
     --cycle \
-    --prompt="$prompt> "
+    --delimiter=$'\t' \
+    --with-nth=2 \
+    --prompt="$prompt> ") || return 1
+
+  selection="${selection%%$'\t'*}"
+  if [[ "$selection" == "$BACK_CHOICE" ]]; then
+    return "$BACK_STATUS"
+  fi
+
+  printf '%s\n' "$selection"
+}
+
+fzf_select_described() {
+  local prompt="$1"
+  local selection
+  local item key desc display
+  local max_key_len=0
+  local back_row=""
+  local -a rows=()
+  shift
+
+  if (($# == 0)); then
+    return 1
+  fi
+
+  for item in "$@"; do
+    key="${item%%$'\t'*}"
+    ((${#key} > max_key_len)) && max_key_len="${#key}"
+  done
+
+  for item in "$@"; do
+    key="${item%%$'\t'*}"
+    if [[ "$item" == *$'\t'* ]]; then
+      desc="${item#*$'\t'}"
+    else
+      desc=""
+    fi
+    printf -v display "%-${max_key_len}s  %s" "$key" "$desc"
+    if [[ "$key" == "$BACK_CHOICE" ]]; then
+      back_row="$key"$'\t'"$display"
+    else
+      rows+=("$key"$'\t'"$display")
+    fi
+  done
+
+  if [[ -n "$back_row" ]]; then
+    rows=("$back_row" "${rows[@]}")
+  fi
+
+  selection=$(printf '%s\n' "${rows[@]}" | "$FZF_BIN" \
+    --height="${KK_FZF_HEIGHT:-70%}" \
+    --layout=reverse \
+    --border \
+    --cycle \
+    --delimiter=$'\t' \
+    --with-nth=2 \
+    --prompt="$prompt> ") || return 1
+
+  selection="${selection%%$'\t'*}"
+  if [[ "$selection" == "$BACK_CHOICE" ]]; then
+    return "$BACK_STATUS"
+  fi
+
+  printf '%s\n' "$selection"
 }
 
 non_empty_lines() {
@@ -173,7 +252,7 @@ choose_namespace() {
     namespaces=("$current")
   fi
 
-  selection=$(fzf_select "namespace" "${namespaces[@]}") || return 1
+  selection=$(fzf_select "namespace" "${namespaces[@]}") || return $?
   printf '%s\n' "$selection"
 }
 
@@ -189,29 +268,31 @@ choose_context() {
     return 1
   fi
 
-  selection=$(fzf_select "context" "${contexts[@]}") || return 1
+  selection=$(fzf_select "context" "${contexts[@]}") || return $?
   printf '%s\n' "$selection"
 }
 
 choose_resource_type() {
-  fzf_select "resource" \
-    "pods" \
-    "deployments" \
-    "services" \
-    "ingress" \
-    "configmaps" \
-    "secrets" \
-    "events"
+  fzf_select_described "resource" \
+    $'pods\t查看 Pod 运行状态和节点分布' \
+    $'deployments\t查看 Deployment 副本和发布状态' \
+    $'services\t查看 Service 暴露方式和端口' \
+    $'ingress\t查看 Ingress 路由规则' \
+    $'configmaps\t查看 ConfigMap 配置' \
+    $'secrets\t查看 Secret 资源名称' \
+    $'events\t查看集群事件并按时间排序' \
+    "${BACK_CHOICE}"$'\t返回上一级菜单'
 }
 
 choose_yaml_resource_type() {
-  fzf_select "resource" \
-    "pods" \
-    "deployments" \
-    "services" \
-    "ingress" \
-    "configmaps" \
-    "secrets"
+  fzf_select_described "resource" \
+    $'pods\t导出 Pod YAML' \
+    $'deployments\t导出 Deployment YAML' \
+    $'services\t导出 Service YAML' \
+    $'ingress\t导出 Ingress YAML' \
+    $'configmaps\t导出 ConfigMap YAML' \
+    $'secrets\t导出 Secret YAML' \
+    "${BACK_CHOICE}"$'\t返回上一级菜单'
 }
 
 choose_named_resource() {
@@ -228,7 +309,7 @@ choose_named_resource() {
     return 1
   fi
 
-  selection=$(fzf_select "$resource" "${items[@]}") || return 1
+  selection=$(fzf_select "$resource" "${items[@]}") || return $?
   printf '%s\n' "$selection"
 }
 
@@ -249,7 +330,7 @@ choose_container() {
       printf '%s\n' "${containers[0]}"
       ;;
     *)
-      selection=$(fzf_select "container" "${containers[@]}") || return 1
+      selection=$(fzf_select "container" "${containers[@]}") || return $?
       printf '%s\n' "$selection"
       ;;
   esac
@@ -281,127 +362,224 @@ prompt_replicas() {
 switch_context() {
   local context
 
-  context=$(choose_context) || return 1
+  context=$(choose_context) || return $?
   run_command normal "$KUBECTL_BIN" config use-context "$context"
 }
 
 switch_namespace() {
   local namespace
 
-  namespace=$(choose_namespace) || return 1
+  namespace=$(choose_namespace) || return $?
   run_command normal "$KUBECTL_BIN" config set-context --current --namespace "$namespace"
 }
 
 view_resources() {
   local namespace resource
   local cmd
+  local status
 
-  namespace=$(choose_namespace) || return 1
-  resource=$(choose_resource_type) || return 1
+  while true; do
+    namespace=$(choose_namespace) || return $?
+    while true; do
+      resource=$(choose_resource_type)
+      status=$?
+      (( status == BACK_STATUS )) && break
+      (( status != 0 )) && return "$status"
 
-  cmd=("$KUBECTL_BIN" get "$resource" -n "$namespace")
-  if [[ "$resource" == "pods" ]]; then
-    cmd+=("-o" "wide")
-  elif [[ "$resource" == "events" ]]; then
-    cmd+=("--sort-by=.lastTimestamp")
-  fi
+      cmd=("$KUBECTL_BIN" get "$resource" -n "$namespace")
+      if [[ "$resource" == "pods" ]]; then
+        cmd+=("-o" "wide")
+      elif [[ "$resource" == "events" ]]; then
+        cmd+=("--sort-by=.lastTimestamp")
+      fi
 
-  run_command normal "${cmd[@]}"
+      run_command normal "${cmd[@]}"
+      return $?
+    done
+  done
 }
 
 describe_pod() {
   local namespace pod
+  local status
 
-  namespace=$(choose_namespace) || return 1
-  pod=$(choose_named_resource "$namespace" pods) || return 1
-  run_command normal "$KUBECTL_BIN" describe "$pod" -n "$namespace"
+  while true; do
+    namespace=$(choose_namespace) || return $?
+    while true; do
+      pod=$(choose_named_resource "$namespace" pods)
+      status=$?
+      (( status == BACK_STATUS )) && break
+      (( status != 0 )) && return "$status"
+
+      run_command normal "$KUBECTL_BIN" describe "$pod" -n "$namespace"
+      return $?
+    done
+  done
 }
 
 logs_for_pod() {
   local previous="$1"
   local namespace pod container
   local cmd
+  local status
 
-  namespace=$(choose_namespace) || return 1
-  pod=$(choose_named_resource "$namespace" pods) || return 1
-  container=$(choose_container "$namespace" "$pod") || return 1
+  while true; do
+    namespace=$(choose_namespace) || return $?
+    while true; do
+      pod=$(choose_named_resource "$namespace" pods)
+      status=$?
+      (( status == BACK_STATUS )) && break
+      (( status != 0 )) && return "$status"
 
-  cmd=("$KUBECTL_BIN" logs "$pod" -n "$namespace")
-  [[ -n "${container:-}" ]] && cmd+=("-c" "$container")
-  if [[ "$previous" == "previous" ]]; then
-    cmd+=("--previous")
-    run_command normal "${cmd[@]}"
-  else
-    cmd+=("--tail=200" "-f")
-    run_log_page "${cmd[@]}"
-  fi
+      while true; do
+        container=$(choose_container "$namespace" "$pod")
+        status=$?
+        (( status == BACK_STATUS )) && break
+        (( status != 0 )) && return "$status"
+
+        cmd=("$KUBECTL_BIN" logs "$pod" -n "$namespace")
+        [[ -n "${container:-}" ]] && cmd+=("-c" "$container")
+        if [[ "$previous" == "previous" ]]; then
+          cmd+=("--previous")
+          run_command normal "${cmd[@]}"
+        else
+          cmd+=("--tail=200" "-f")
+          run_log_page "${cmd[@]}"
+        fi
+        return $?
+      done
+    done
+  done
 }
 
 exec_shell() {
   local namespace pod container shell
   local cmd
+  local status
 
-  namespace=$(choose_namespace) || return 1
-  pod=$(choose_named_resource "$namespace" pods) || return 1
-  container=$(choose_container "$namespace" "$pod") || return 1
-  shell=$(fzf_select "shell" "sh" "bash" "ash") || return 1
+  while true; do
+    namespace=$(choose_namespace) || return $?
+    while true; do
+      pod=$(choose_named_resource "$namespace" pods)
+      status=$?
+      (( status == BACK_STATUS )) && break
+      (( status != 0 )) && return "$status"
 
-  cmd=("$KUBECTL_BIN" exec -it "$pod" -n "$namespace")
-  [[ -n "${container:-}" ]] && cmd+=("-c" "$container")
-  cmd+=("--" "$shell")
+      while true; do
+        container=$(choose_container "$namespace" "$pod")
+        status=$?
+        (( status == BACK_STATUS )) && break
+        (( status != 0 )) && return "$status"
 
-  run_command high "${cmd[@]}"
+        while true; do
+          shell=$(fzf_select_described "shell" \
+            $'sh\t通用 POSIX shell，容器里最常见' \
+            $'bash\t功能更完整，镜像里不一定安装' \
+            $'ash\tAlpine/busybox 常见 shell' \
+            "${BACK_CHOICE}"$'\t返回上一级菜单')
+          status=$?
+          (( status == BACK_STATUS )) && break
+          (( status != 0 )) && return "$status"
+
+          cmd=("$KUBECTL_BIN" exec -it "$pod" -n "$namespace")
+          [[ -n "${container:-}" ]] && cmd+=("-c" "$container")
+          cmd+=("--" "$shell")
+
+          run_command high "${cmd[@]}"
+          return $?
+        done
+      done
+    done
+  done
 }
 
 get_yaml() {
   local namespace resource item
+  local status
 
-  namespace=$(choose_namespace) || return 1
-  resource=$(choose_yaml_resource_type) || return 1
-  item=$(choose_named_resource "$namespace" "$resource") || return 1
-  run_command normal "$KUBECTL_BIN" get "$item" -n "$namespace" -o yaml
+  while true; do
+    namespace=$(choose_namespace) || return $?
+    while true; do
+      resource=$(choose_yaml_resource_type)
+      status=$?
+      (( status == BACK_STATUS )) && break
+      (( status != 0 )) && return "$status"
+
+      while true; do
+        item=$(choose_named_resource "$namespace" "$resource")
+        status=$?
+        (( status == BACK_STATUS )) && break
+        (( status != 0 )) && return "$status"
+
+        run_command normal "$KUBECTL_BIN" get "$item" -n "$namespace" -o yaml
+        return $?
+      done
+    done
+  done
 }
 
 watch_pods() {
   local namespace
 
-  namespace=$(choose_namespace) || return 1
+  namespace=$(choose_namespace) || return $?
   run_command normal "$KUBECTL_BIN" get pods -n "$namespace" -w
 }
 
 top_resources() {
   local choice namespace
+  local status
 
-  choice=$(fzf_select "top" "pods" "nodes") || return 1
-  if [[ "$choice" == "nodes" ]]; then
-    run_command normal "$KUBECTL_BIN" top nodes
-  else
-    namespace=$(choose_namespace) || return 1
-    run_command normal "$KUBECTL_BIN" top pods -n "$namespace"
-  fi
+  while true; do
+    choice=$(fzf_select_described "top" \
+      $'pods\t查看当前 namespace 的 Pod 资源使用' \
+      $'nodes\t查看节点资源使用' \
+      "${BACK_CHOICE}"$'\t返回上一级菜单') || return $?
+
+    status=0
+    if [[ "$choice" == "nodes" ]]; then
+      run_command normal "$KUBECTL_BIN" top nodes
+      status=$?
+    else
+      namespace=$(choose_namespace) || status=$?
+      if (( status == 0 )); then
+        run_command normal "$KUBECTL_BIN" top pods -n "$namespace"
+        status=$?
+      fi
+    fi
+
+    (( status == BACK_STATUS )) && continue
+    return "$status"
+  done
 }
 
 troubleshooting_menu() {
   local choice
+  local status
 
-  choice=$(fzf_select "troubleshoot" \
-    "describe pod" \
-    "logs" \
-    "previous logs" \
-    "exec shell" \
-    "get yaml" \
-    "watch pods" \
-    "top pods/nodes") || return 1
+  while true; do
+    choice=$(fzf_select_described "troubleshoot" \
+      $'describe pod\t查看 Pod 事件、调度和容器状态' \
+      $'logs\t进入 Pod 实时日志页面' \
+      $'previous logs\t查看上一次崩溃容器日志' \
+      $'exec shell\t进入容器 shell' \
+      $'get yaml\t导出资源 YAML 便于排查字段' \
+      $'watch pods\t持续观察 Pod 状态变化' \
+      $'top pods/nodes\t查看资源使用情况' \
+      "${BACK_CHOICE}"$'\t返回上一级菜单') || return $?
 
-  case "$choice" in
-    "describe pod") describe_pod ;;
-    "logs") logs_for_pod current ;;
-    "previous logs") logs_for_pod previous ;;
-    "exec shell") exec_shell ;;
-    "get yaml") get_yaml ;;
-    "watch pods") watch_pods ;;
-    "top pods/nodes") top_resources ;;
-  esac
+    case "$choice" in
+      "describe pod") describe_pod; status=$? ;;
+      "logs") logs_for_pod current; status=$? ;;
+      "previous logs") logs_for_pod previous; status=$? ;;
+      "exec shell") exec_shell; status=$? ;;
+      "get yaml") get_yaml; status=$? ;;
+      "watch pods") watch_pods; status=$? ;;
+      "top pods/nodes") top_resources; status=$? ;;
+    esac
+
+    (( status == BACK_STATUS )) && continue
+    return "$status"
+  done
 }
 
 explain_resource() {
@@ -413,79 +591,129 @@ explain_resource() {
 
 learning_menu() {
   local choice
+  local status
 
-  choice=$(fzf_select "learn" \
-    "kubectl explain" \
-    "kubectl api-resources" \
-    "kubectl version") || return 1
+  while true; do
+    choice=$(fzf_select_described "learn" \
+      $'kubectl explain\t查询资源字段含义和 YAML 写法' \
+      $'kubectl api-resources\t列出集群支持的资源类型和短名称' \
+      $'kubectl version\t查看本机 kubectl 客户端版本' \
+      "${BACK_CHOICE}"$'\t返回上一级菜单') || return $?
 
-  case "$choice" in
-    "kubectl explain") explain_resource ;;
-    "kubectl api-resources") run_command normal "$KUBECTL_BIN" api-resources ;;
-    "kubectl version") run_command normal "$KUBECTL_BIN" version --client ;;
-  esac
+    case "$choice" in
+      "kubectl explain") explain_resource; status=$? ;;
+      "kubectl api-resources") run_command normal "$KUBECTL_BIN" api-resources; status=$? ;;
+      "kubectl version") run_command normal "$KUBECTL_BIN" version --client; status=$? ;;
+    esac
+
+    (( status == BACK_STATUS )) && continue
+    return "$status"
+  done
 }
 
 apply_manifest() {
   local namespace path
 
-  namespace=$(choose_namespace) || return 1
+  namespace=$(choose_namespace) || return $?
   path=$(prompt_text "Manifest file or directory") || return 1
   run_command high "$KUBECTL_BIN" apply -n "$namespace" -f "$path"
 }
 
 delete_resource() {
   local namespace resource item
+  local status
 
-  namespace=$(choose_namespace) || return 1
-  resource=$(choose_resource_type) || return 1
-  item=$(choose_named_resource "$namespace" "$resource") || return 1
-  run_command high "$KUBECTL_BIN" delete "$item" -n "$namespace"
+  while true; do
+    namespace=$(choose_namespace) || return $?
+    while true; do
+      resource=$(choose_resource_type)
+      status=$?
+      (( status == BACK_STATUS )) && break
+      (( status != 0 )) && return "$status"
+
+      while true; do
+        item=$(choose_named_resource "$namespace" "$resource")
+        status=$?
+        (( status == BACK_STATUS )) && break
+        (( status != 0 )) && return "$status"
+
+        run_command high "$KUBECTL_BIN" delete "$item" -n "$namespace"
+        return $?
+      done
+    done
+  done
 }
 
 rollout_restart() {
   local namespace deploy
+  local status
 
-  namespace=$(choose_namespace) || return 1
-  deploy=$(choose_named_resource "$namespace" deployments) || return 1
-  run_command high "$KUBECTL_BIN" rollout restart "$deploy" -n "$namespace"
+  while true; do
+    namespace=$(choose_namespace) || return $?
+    while true; do
+      deploy=$(choose_named_resource "$namespace" deployments)
+      status=$?
+      (( status == BACK_STATUS )) && break
+      (( status != 0 )) && return "$status"
+
+      run_command high "$KUBECTL_BIN" rollout restart "$deploy" -n "$namespace"
+      return $?
+    done
+  done
 }
 
 scale_deployment() {
   local namespace deploy replicas
+  local status
 
-  namespace=$(choose_namespace) || return 1
-  deploy=$(choose_named_resource "$namespace" deployments) || return 1
-  replicas=$(prompt_replicas) || return 1
-  run_command high "$KUBECTL_BIN" scale "$deploy" -n "$namespace" --replicas "$replicas"
+  while true; do
+    namespace=$(choose_namespace) || return $?
+    while true; do
+      deploy=$(choose_named_resource "$namespace" deployments)
+      status=$?
+      (( status == BACK_STATUS )) && break
+      (( status != 0 )) && return "$status"
+
+      replicas=$(prompt_replicas) || return 1
+      run_command high "$KUBECTL_BIN" scale "$deploy" -n "$namespace" --replicas "$replicas"
+      return $?
+    done
+  done
 }
 
 change_menu() {
   local choice
+  local status
 
-  choice=$(fzf_select "change" \
-    "apply manifest" \
-    "delete resource" \
-    "rollout restart deployment" \
-    "scale deployment") || return 1
+  while true; do
+    choice=$(fzf_select_described "change" \
+      $'apply manifest\t应用 YAML 文件或目录' \
+      $'delete resource\t删除选中的资源' \
+      $'rollout restart deployment\t重启 Deployment 触发滚动发布' \
+      $'scale deployment\t调整 Deployment 副本数' \
+      "${BACK_CHOICE}"$'\t返回上一级菜单') || return $?
 
-  case "$choice" in
-    "apply manifest") apply_manifest ;;
-    "delete resource") delete_resource ;;
-    "rollout restart deployment") rollout_restart ;;
-    "scale deployment") scale_deployment ;;
-  esac
+    case "$choice" in
+      "apply manifest") apply_manifest; status=$? ;;
+      "delete resource") delete_resource; status=$? ;;
+      "rollout restart deployment") rollout_restart; status=$? ;;
+      "scale deployment") scale_deployment; status=$? ;;
+    esac
+
+    (( status == BACK_STATUS )) && continue
+    return "$status"
+  done
 }
 
 main_menu() {
-  fzf_select "kk" \
-    "switch context" \
-    "switch namespace" \
-    "view resources" \
-    "troubleshooting" \
-    "learn / discover" \
-    "change resources" \
-    "quit"
+  fzf_select_described "kk" \
+    $'switch context\t切换当前 kubectl context' \
+    $'switch namespace\t切换当前 context 的默认 namespace' \
+    $'view resources\t查看常用 Kubernetes 资源' \
+    $'troubleshooting\t查看日志、describe、exec 和排障信息' \
+    $'learn / discover\t查询 kubectl 字段、资源类型和版本' \
+    $'change resources\t执行 apply、delete、restart、scale 等变更' \
+    $'quit\t退出 kk'
 }
 
 main_loop() {
@@ -507,11 +735,11 @@ main_loop() {
       "quit") exit 0 ;;
     esac
 
-    (( PRINT_ONLY )) && exit 0
-    if (( status != 0 )); then
+    (( PRINT_ONLY && status != BACK_STATUS )) && exit 0
+    if (( status != 0 && status != BACK_STATUS )); then
       printf '\nAction did not complete. Check the message above, or try another namespace/pod.\n' >&2
     fi
-    if (( status != 0 || ! SKIP_PAUSE )); then
+    if (( status != BACK_STATUS && (status != 0 || ! SKIP_PAUSE) )); then
       pause_if_interactive
     fi
   done
