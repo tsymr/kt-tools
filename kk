@@ -3,6 +3,10 @@ set -uo pipefail
 
 SCRIPT_NAME="${0##*/}"
 KUBECTL_BIN="${KUBECTL:-kubectl}"
+KTCTL_BIN="${KTCTL:-ktctl}"
+KT_KUBECONFIG="${KT_KUBECONFIG:-${KUBECONFIG:-/home/ts/.kube/config}}"
+KT_CONNECT_SUDO="${KT_CONNECT_SUDO:-1}"
+KT_CONNECT_STATE_DIR="${KT_CONNECT_STATE_DIR:-/tmp}"
 FZF_BIN="${FZF:-fzf}"
 PRINT_ONLY=0
 SKIP_PAUSE=0
@@ -19,17 +23,27 @@ Usage:
   kk --help
 
 Options:
-  --print   Build a kubectl command interactively and print it without running it.
+  --print   Build a kubectl/ktctl command interactively and print it without running it.
   --help    Show this help text.
 
 Environment:
   KUBECTL   kubectl executable to use. Defaults to kubectl.
+  KTCTL     ktctl executable to use. Defaults to ktctl.
+  KT_KUBECONFIG
+            kubeconfig passed to ktctl --kubeconfig.
+            Defaults to KUBECONFIG or /home/ts/.kube/config.
+  KT_CONNECT_SUDO
+            use sudo for ktctl connect. Defaults to 1.
+  KT_CONNECT_STATE_DIR
+            directory for ktctl connect pid/log files. Defaults to /tmp.
   FZF       fzf executable to use. Defaults to fzf.
 
 Examples:
   kk
   kk --print
   KUBECTL=/usr/local/bin/kubectl kk
+  KTCTL=/usr/local/bin/ktctl kk
+  KT_CONNECT_SUDO=0 kk
 EOF
 }
 
@@ -357,6 +371,275 @@ prompt_replicas() {
     fi
     printf 'Replicas must be a non-negative integer.\n' >&2
   done
+}
+
+prompt_backable_text() {
+  local prompt="$1"
+  local value
+
+  read -r -p "$prompt (empty or '.. back' to go back): " value
+  if [[ -z "$value" || "$value" == "$BACK_CHOICE" ]]; then
+    return "$BACK_STATUS"
+  fi
+  printf '%s\n' "$value"
+}
+
+prompt_port() {
+  local value
+
+  while true; do
+    value=$(prompt_backable_text "Service port") || return $?
+    if [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+    printf 'Service port must be a positive integer.\n' >&2
+  done
+}
+
+choose_kt_namespace() {
+  local output namespace selection
+  local seen="|"
+  local -a options=()
+
+  for namespace in creams-rc creams-staging creams-dp-finance; do
+    options+=("$namespace"$'\t'"快捷 namespace")
+    seen+="$namespace|"
+  done
+
+  if output=$(kubectl_output get ns -o name); then
+    while IFS= read -r namespace; do
+      namespace="${namespace#namespace/}"
+      [[ -n "$namespace" ]] || continue
+      case "$seen" in
+        *"|$namespace|"*) ;;
+        *)
+          options+=("$namespace"$'\t'"集群 namespace")
+          seen+="$namespace|"
+          ;;
+      esac
+    done < <(printf '%s\n' "$output" | non_empty_lines)
+  fi
+
+  selection=$(fzf_select_described "kt namespace" "${options[@]}" "${BACK_CHOICE}"$'\t返回上一级菜单') || return $?
+  printf '%s\n' "$selection"
+}
+
+choose_kt_mode() {
+  fzf_select_described "kt mode" \
+    $'connect\t后台启动网络隧道，启动后返回此菜单' \
+    $'connect foreground\t前台启动网络隧道，占用当前终端' \
+    $'show connect log\t查看后台 connect 日志快照，按 q 返回' \
+    $'stop connect\t停止后台 connect 进程' \
+    $'exchange\t将 Service 全量流量转发到本地' \
+    $'mesh\t按 versionMark/header 将标记流量转发到本地' \
+    $'preview\t将本地服务暴露给集群访问' \
+    "${BACK_CHOICE}"$'\t返回上一级菜单'
+}
+
+choose_service() {
+  local namespace="$1"
+  local output selection
+  local services=()
+
+  output=$(kubectl_output get services -n "$namespace" -o name) || return 1
+  mapfile -t services < <(printf '%s\n' "$output" | sed 's#^service/##' | non_empty_lines)
+
+  if ((${#services[@]} == 0)); then
+    printf 'No services found in namespace %s.\n' "$namespace" >&2
+    return 1
+  fi
+
+  selection=$(fzf_select "service" "${services[@]}") || return $?
+  printf '%s\n' "$selection"
+}
+
+choose_service_port() {
+  local namespace="$1"
+  local service="$2"
+  local output port choice
+  local -a options=()
+
+  if output=$(kubectl_output get service "$service" -n "$namespace" -o 'jsonpath={.spec.ports[*].port}'); then
+    while IFS= read -r port; do
+      [[ -n "$port" ]] || continue
+      options+=("$port"$'\t'"Service 端口")
+    done < <(printf '%s\n' "$output" | tr '[:space:]' '\n' | non_empty_lines)
+  fi
+
+  options+=("custom"$'\t手动输入端口')
+  choice=$(fzf_select_described "service port" "${options[@]}" "${BACK_CHOICE}"$'\t返回上一级菜单') || return $?
+
+  if [[ "$choice" == "custom" ]]; then
+    prompt_port
+  else
+    printf '%s\n' "$choice"
+  fi
+}
+
+run_kt_command() {
+  local namespace="$1"
+  local -a cmd
+  shift
+
+  if (( ! PRINT_ONLY )); then
+    require_cmd "$KTCTL_BIN"
+  fi
+
+  cmd=("$KTCTL_BIN" -n "$namespace")
+  if [[ -n "$KT_KUBECONFIG" ]]; then
+    cmd+=("--kubeconfig" "$KT_KUBECONFIG")
+  fi
+  cmd+=("$@")
+
+  run_command high "${cmd[@]}"
+}
+
+kt_connect_id() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+kt_connect_pid_file() {
+  printf '%s/kk-kt-connect-%s.pid\n' "$KT_CONNECT_STATE_DIR" "$(kt_connect_id "$1")"
+}
+
+kt_connect_log_file() {
+  printf '%s/kk-kt-connect-%s.log\n' "$KT_CONNECT_STATE_DIR" "$(kt_connect_id "$1")"
+}
+
+build_kt_connect_cmd() {
+  local namespace="$1"
+  local sudo_mode="${2:-foreground}"
+
+  if [[ "$KT_CONNECT_SUDO" != "0" && "$sudo_mode" == "background" ]]; then
+    printf '%s\0' sudo -n "$KTCTL_BIN" -n "$namespace"
+  elif [[ "$KT_CONNECT_SUDO" != "0" ]]; then
+    printf '%s\0' sudo "$KTCTL_BIN" -n "$namespace"
+  else
+    printf '%s\0' "$KTCTL_BIN" -n "$namespace"
+  fi
+
+  if [[ -n "$KT_KUBECONFIG" ]]; then
+    printf '%s\0' --kubeconfig "$KT_KUBECONFIG"
+  fi
+  printf '%s\0' connect
+}
+
+run_kt_connect_foreground() {
+  local namespace="$1"
+  local -a cmd
+
+  if (( ! PRINT_ONLY )); then
+    require_cmd "$KTCTL_BIN"
+    [[ "$KT_CONNECT_SUDO" == "0" ]] || require_cmd sudo
+  fi
+
+  mapfile -d '' -t cmd < <(build_kt_connect_cmd "$namespace" foreground)
+  run_command high "${cmd[@]}"
+}
+
+run_kt_connect_background() {
+  local namespace="$1"
+  local pid_file log_file pid
+  local -a cmd
+
+  pid_file=$(kt_connect_pid_file "$namespace")
+  log_file=$(kt_connect_log_file "$namespace")
+  mapfile -d '' -t cmd < <(build_kt_connect_cmd "$namespace" background)
+
+  printf '\nBackground command:\n  '
+  quote_cmd "${cmd[@]}"
+  printf '\nLog:\n  %s\nPID file:\n  %s\n' "$log_file" "$pid_file"
+
+  if (( PRINT_ONLY )); then
+    return 0
+  fi
+
+  require_cmd "$KTCTL_BIN"
+  require_cmd nohup
+  if [[ "$KT_CONNECT_SUDO" != "0" ]]; then
+    require_cmd sudo
+    printf '\nRefreshing sudo credentials for background ktctl connect...\n'
+    sudo -v || return $?
+  fi
+
+  if [[ -f "$pid_file" ]]; then
+    pid=$(cat "$pid_file" 2>/dev/null || true)
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      printf 'ktctl connect already running for namespace %s, pid %s.\n' "$namespace" "$pid"
+      printf 'Log: %s\n' "$log_file"
+      return 0
+    fi
+  fi
+
+  # Keep background ktctl out of this terminal's Ctrl+C signal path.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid nohup "${cmd[@]}" >"$log_file" 2>&1 < /dev/null &
+  else
+    (
+      trap '' INT HUP
+      exec nohup "${cmd[@]}" >"$log_file" 2>&1 < /dev/null
+    ) &
+  fi
+  pid=$!
+  printf '%s\n' "$pid" >"$pid_file"
+  disown "$pid" 2>/dev/null || true
+
+  printf 'Started ktctl connect in background, pid %s.\n' "$pid"
+  printf 'Log: %s\n' "$log_file"
+}
+
+show_kt_connect_log() {
+  local namespace="$1"
+  local log_file
+
+  log_file=$(kt_connect_log_file "$namespace")
+  if [[ ! -f "$log_file" ]]; then
+    printf 'No ktctl connect log found for namespace %s.\n' "$namespace" >&2
+    printf 'Expected log: %s\n' "$log_file" >&2
+    return 1
+  fi
+
+  if command -v less >/dev/null 2>&1; then
+    less -R "$log_file"
+  else
+    tail -n 200 "$log_file"
+  fi
+}
+
+stop_kt_connect() {
+  local namespace="$1"
+  local pid_file log_file pid
+
+  pid_file=$(kt_connect_pid_file "$namespace")
+  log_file=$(kt_connect_log_file "$namespace")
+
+  if [[ ! -f "$pid_file" ]]; then
+    printf 'No ktctl connect pid file found for namespace %s.\n' "$namespace" >&2
+    return 1
+  fi
+
+  pid=$(cat "$pid_file" 2>/dev/null || true)
+  if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+    printf 'Invalid pid file: %s\n' "$pid_file" >&2
+    return 1
+  fi
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    printf 'ktctl connect pid %s is not running. Removing stale pid file.\n' "$pid"
+    rm -f "$pid_file"
+    return 0
+  fi
+
+  printf '\nCommand:\n  kill -TERM -- -%s 2>/dev/null || kill -TERM %s\n' "$pid" "$pid"
+  if (( PRINT_ONLY )); then
+    return 0
+  fi
+
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid"
+  rm -f "$pid_file"
+  printf 'Stopped ktctl connect pid %s for namespace %s.\n' "$pid" "$namespace"
+  printf 'Log kept at: %s\n' "$log_file"
 }
 
 switch_context() {
@@ -705,6 +988,76 @@ change_menu() {
   done
 }
 
+kt_connect_menu() {
+  local namespace mode service port header
+  local status
+
+  while true; do
+    namespace=$(choose_kt_namespace) || return $?
+    while true; do
+      mode=$(choose_kt_mode)
+      status=$?
+      (( status == BACK_STATUS )) && break
+      (( status != 0 )) && return "$status"
+
+      case "$mode" in
+        "connect")
+          run_kt_connect_background "$namespace"
+          status=$?
+          (( PRINT_ONLY )) && return "$status"
+          (( status == 0 )) && continue
+          return "$status"
+          ;;
+        "connect foreground")
+          run_kt_connect_foreground "$namespace"
+          return $?
+          ;;
+        "show connect log")
+          show_kt_connect_log "$namespace"
+          status=$?
+          (( PRINT_ONLY )) && return "$status"
+          (( status == 0 )) && continue
+          return "$status"
+          ;;
+        "stop connect")
+          stop_kt_connect "$namespace"
+          status=$?
+          (( PRINT_ONLY )) && return "$status"
+          (( status == 0 )) && continue
+          return "$status"
+          ;;
+        "exchange"|"mesh"|"preview")
+          while true; do
+            service=$(choose_service "$namespace")
+            status=$?
+            (( status == BACK_STATUS )) && break
+            (( status != 0 )) && return "$status"
+
+            while true; do
+              port=$(choose_service_port "$namespace" "$service")
+              status=$?
+              (( status == BACK_STATUS )) && break
+              (( status != 0 )) && return "$status"
+
+              if [[ "$mode" == "mesh" ]]; then
+                header=$(prompt_backable_text "Version mark / header") || status=$?
+                (( status == BACK_STATUS )) && continue
+                (( status != 0 )) && return "$status"
+                run_kt_command "$namespace" mesh "$service" --expose "$port" --versionMark "$header"
+              elif [[ "$mode" == "exchange" ]]; then
+                run_kt_command "$namespace" exchange "$service" --expose "$port"
+              else
+                run_kt_command "$namespace" preview "$service" --expose "$port"
+              fi
+              return $?
+            done
+          done
+          ;;
+      esac
+    done
+  done
+}
+
 main_menu() {
   fzf_select_described "kk" \
     $'switch context\t切换当前 kubectl context' \
@@ -712,6 +1065,7 @@ main_menu() {
     $'view resources\t查看常用 Kubernetes 资源' \
     $'troubleshooting\t查看日志、describe、exec 和排障信息' \
     $'learn / discover\t查询 kubectl 字段、资源类型和版本' \
+    $'kt connect\t本地联调、流量转发和预览' \
     $'change resources\t执行 apply、delete、restart、scale 等变更' \
     $'quit\t退出 kk'
 }
@@ -731,6 +1085,7 @@ main_loop() {
       "view resources") view_resources; status=$? ;;
       "troubleshooting") troubleshooting_menu; status=$? ;;
       "learn / discover") learning_menu; status=$? ;;
+      "kt connect") kt_connect_menu; status=$? ;;
       "change resources") change_menu; status=$? ;;
       "quit") exit 0 ;;
     esac

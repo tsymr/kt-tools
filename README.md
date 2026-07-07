@@ -12,6 +12,7 @@ container，然后执行对应的 `kubectl` 命令。
 
 - `bash`
 - `kubectl`
+- `ktctl` 可选；只有使用 `kt connect` 菜单时需要
 - `fzf`
 - `less` 可选，但推荐安装，用于日志页面
 
@@ -47,6 +48,9 @@ kk --help   # 查看帮助
 
 ```bash
 KUBECTL=/usr/local/bin/kubectl kk
+KTCTL=/usr/local/bin/ktctl kk
+KT_KUBECONFIG=/home/ts/.kube/config kk
+KT_CONNECT_SUDO=0 kk
 FZF=/usr/bin/fzf kk
 ```
 
@@ -66,6 +70,7 @@ namespace 选择，从 container 选择返回到 Pod 选择。
 - `view resources`：查看常用 Kubernetes 资源
 - `troubleshooting`：查看日志、describe、exec 和排障信息
 - `learn / discover`：查询 kubectl 字段、资源类型和版本
+- `kt connect`：本地联调、流量转发和预览
 - `change resources`：执行 apply、delete、restart、scale 等变更
 
 资源查看支持 pods、deployments、services、ingress、configmaps、secrets
@@ -94,6 +99,41 @@ namespace 选择，从 container 选择返回到 Pod 选择。
 - `rollout restart deployment`：重启 Deployment 触发滚动发布
 - `scale deployment`：调整 Deployment 副本数
 
+kt connect 菜单：
+
+- `connect`：后台启动本地到集群的网络隧道，启动后返回 kt 菜单
+- `connect foreground`：前台启动网络隧道，占用当前终端
+- `show connect log`：查看后台 connect 日志快照，按 `q` 返回
+- `stop connect`：停止后台 connect 进程
+- `exchange`：将 Service 全量流量转发到本地
+- `mesh`：按 versionMark/header 将标记流量转发到本地
+- `preview`：将本地服务暴露给集群访问
+
+`kt connect` 的 namespace 会优先显示常用快捷项：
+
+- `creams-rc`
+- `creams-staging`
+- `creams-dp-finance`
+
+执行 `ktctl` 时会显式追加 `--kubeconfig`。默认使用 `KUBECONFIG`；
+如果未设置，则使用 `/home/ts/.kube/config`，避免 `sudo ktctl connect`
+时丢失普通用户的 kubeconfig。
+
+`ktctl connect` 通常需要配置本机网络路由，默认会以 `sudo ktctl ... connect`
+后台执行，并把 PID 和日志放在 `/tmp`。后台进程会尽量用独立会话启动，避免
+你在日志页按 `Ctrl+C` 时误停掉 connect。这样启动 connect 后可以继续在同一个
+`kk` 菜单里选择 `exchange` 或 `mesh`。
+
+如果你明确不需要 sudo，可以设置：
+
+```bash
+KT_CONNECT_SUDO=0 kk
+```
+
+后台 connect 的状态目录默认为 `/tmp`，可通过 `KT_CONNECT_STATE_DIR` 覆盖。
+`show connect log` 不会跟随日志，按 `q` 返回；即使误按 `Ctrl+C`，也不应影响
+后台 connect 进程。
+
 ## 日志
 
 `troubleshooting -> logs` 会打开持续跟随的日志页面：
@@ -114,6 +154,9 @@ kubectl logs pod/<name> -n <namespace> -c <container> --tail=200 -f | less -R +F
 
 `kk` 会在执行前打印生成的命令，但不会再次询问确认。选择操作后，命令会
 直接执行，除非使用 `--print`。
+
+`kt connect` 里的 `exchange`、`mesh`、`preview` 会创建 ktctl 资源或影响
+Service 流量。首次使用建议先通过 `kk --print` 检查生成的命令。
 
 如果只想检查生成的命令、不希望访问或修改集群，使用：
 
