@@ -4,7 +4,11 @@ set -uo pipefail
 SCRIPT_NAME="${0##*/}"
 KUBECTL_BIN="${KUBECTL:-kubectl}"
 KTCTL_BIN="${KTCTL:-ktctl}"
-KT_KUBECONFIG="${KT_KUBECONFIG:-${KUBECONFIG:-/home/ts/.kube/config}}"
+DEFAULT_KUBECONFIG=""
+if [[ -n "${HOME:-}" ]]; then
+  DEFAULT_KUBECONFIG="$HOME/.kube/config"
+fi
+KT_KUBECONFIG="${KT_KUBECONFIG:-${KUBECONFIG:-$DEFAULT_KUBECONFIG}}"
 KT_CONNECT_SUDO="${KT_CONNECT_SUDO:-1}"
 KT_CONNECT_STATE_DIR="${KT_CONNECT_STATE_DIR:-/tmp}"
 FZF_BIN="${FZF:-fzf}"
@@ -12,6 +16,7 @@ PRINT_ONLY=0
 SKIP_PAUSE=0
 BACK_CHOICE=".. back"
 BACK_STATUS=10
+KT_CONNECT_CMD=()
 
 usage() {
   cat <<'EOF'
@@ -31,7 +36,7 @@ Environment:
   KTCTL     ktctl executable to use. Defaults to ktctl.
   KT_KUBECONFIG
             kubeconfig passed to ktctl --kubeconfig.
-            Defaults to KUBECONFIG or /home/ts/.kube/config.
+            Defaults to KUBECONFIG or $HOME/.kube/config.
   KT_CONNECT_SUDO
             use sudo for ktctl connect. Defaults to 1.
   KT_CONNECT_STATE_DIR
@@ -252,14 +257,16 @@ kubectl_output() {
 }
 
 choose_namespace() {
-  local current output selection
+  local current output selection namespace
   local namespaces=()
 
   current=$("$KUBECTL_BIN" config view --minify --output 'jsonpath={..namespace}' 2>/dev/null)
   [[ -n "$current" ]] || current="default"
 
   if output=$(kubectl_output get ns -o name); then
-    mapfile -t namespaces < <(printf '%s\n' "$output" | sed 's#^namespace/##' | non_empty_lines)
+    while IFS= read -r namespace; do
+      namespaces+=("$namespace")
+    done < <(printf '%s\n' "$output" | sed 's#^namespace/##' | non_empty_lines)
   fi
 
   if ((${#namespaces[@]} == 0)); then
@@ -271,11 +278,13 @@ choose_namespace() {
 }
 
 choose_context() {
-  local output selection
+  local output selection context
   local contexts=()
 
   output=$(kubectl_output config get-contexts -o name) || return 1
-  mapfile -t contexts < <(printf '%s\n' "$output" | non_empty_lines)
+  while IFS= read -r context; do
+    contexts+=("$context")
+  done < <(printf '%s\n' "$output" | non_empty_lines)
 
   if ((${#contexts[@]} == 0)); then
     printf 'No kubectl contexts found.\n' >&2
@@ -312,11 +321,13 @@ choose_yaml_resource_type() {
 choose_named_resource() {
   local namespace="$1"
   local resource="$2"
-  local output selection
+  local output selection item
   local items=()
 
   output=$(kubectl_output get "$resource" -n "$namespace" -o name) || return 1
-  mapfile -t items < <(printf '%s\n' "$output" | non_empty_lines)
+  while IFS= read -r item; do
+    items+=("$item")
+  done < <(printf '%s\n' "$output" | non_empty_lines)
 
   if ((${#items[@]} == 0)); then
     printf 'No %s found in namespace %s.\n' "$resource" "$namespace" >&2
@@ -330,13 +341,15 @@ choose_named_resource() {
 choose_container() {
   local namespace="$1"
   local pod="$2"
-  local pod_name output selection
+  local pod_name output selection container
   local containers=()
 
   pod_name="${pod#pod/}"
   output=$(kubectl_output get pod "$pod_name" -n "$namespace" \
     -o 'jsonpath={.spec.initContainers[*].name} {.spec.containers[*].name}') || return 1
-  mapfile -t containers < <(printf '%s\n' "$output" | tr '[:space:]' '\n' | non_empty_lines)
+  while IFS= read -r container; do
+    containers+=("$container")
+  done < <(printf '%s\n' "$output" | tr '[:space:]' '\n' | non_empty_lines)
 
   case "${#containers[@]}" in
     0) return 0 ;;
@@ -439,11 +452,13 @@ choose_kt_mode() {
 
 choose_service() {
   local namespace="$1"
-  local output selection
+  local output selection service
   local services=()
 
   output=$(kubectl_output get services -n "$namespace" -o name) || return 1
-  mapfile -t services < <(printf '%s\n' "$output" | sed 's#^service/##' | non_empty_lines)
+  while IFS= read -r service; do
+    services+=("$service")
+  done < <(printf '%s\n' "$output" | sed 's#^service/##' | non_empty_lines)
 
   if ((${#services[@]} == 0)); then
     printf 'No services found in namespace %s.\n' "$namespace" >&2
@@ -511,18 +526,19 @@ build_kt_connect_cmd() {
   local namespace="$1"
   local sudo_mode="${2:-foreground}"
 
+  KT_CONNECT_CMD=()
   if [[ "$KT_CONNECT_SUDO" != "0" && "$sudo_mode" == "background" ]]; then
-    printf '%s\0' sudo -n "$KTCTL_BIN" -n "$namespace"
+    KT_CONNECT_CMD=(sudo -n "$KTCTL_BIN" -n "$namespace")
   elif [[ "$KT_CONNECT_SUDO" != "0" ]]; then
-    printf '%s\0' sudo "$KTCTL_BIN" -n "$namespace"
+    KT_CONNECT_CMD=(sudo "$KTCTL_BIN" -n "$namespace")
   else
-    printf '%s\0' "$KTCTL_BIN" -n "$namespace"
+    KT_CONNECT_CMD=("$KTCTL_BIN" -n "$namespace")
   fi
 
   if [[ -n "$KT_KUBECONFIG" ]]; then
-    printf '%s\0' --kubeconfig "$KT_KUBECONFIG"
+    KT_CONNECT_CMD+=("--kubeconfig" "$KT_KUBECONFIG")
   fi
-  printf '%s\0' connect
+  KT_CONNECT_CMD+=(connect)
 }
 
 run_kt_connect_foreground() {
@@ -534,7 +550,8 @@ run_kt_connect_foreground() {
     [[ "$KT_CONNECT_SUDO" == "0" ]] || require_cmd sudo
   fi
 
-  mapfile -d '' -t cmd < <(build_kt_connect_cmd "$namespace" foreground)
+  build_kt_connect_cmd "$namespace" foreground
+  cmd=("${KT_CONNECT_CMD[@]}")
   run_command high "${cmd[@]}"
 }
 
@@ -545,7 +562,8 @@ run_kt_connect_background() {
 
   pid_file=$(kt_connect_pid_file "$namespace")
   log_file=$(kt_connect_log_file "$namespace")
-  mapfile -d '' -t cmd < <(build_kt_connect_cmd "$namespace" background)
+  build_kt_connect_cmd "$namespace" background
+  cmd=("${KT_CONNECT_CMD[@]}")
 
   printf '\nBackground command:\n  '
   quote_cmd "${cmd[@]}"
@@ -631,12 +649,12 @@ stop_kt_connect() {
     return 0
   fi
 
-  printf '\nCommand:\n  kill -TERM -- -%s 2>/dev/null || kill -TERM %s\n' "$pid" "$pid"
+  printf '\nCommand:\n  kill -TERM -%s 2>/dev/null || kill -TERM %s\n' "$pid" "$pid"
   if (( PRINT_ONLY )); then
     return 0
   fi
 
-  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid"
+  kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid"
   rm -f "$pid_file"
   printf 'Stopped ktctl connect pid %s for namespace %s.\n' "$pid" "$namespace"
   printf 'Log kept at: %s\n' "$log_file"

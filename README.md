@@ -16,6 +16,14 @@ container，然后执行对应的 `kubectl` 命令。
 - `fzf`
 - `less` 可选，但推荐安装，用于日志页面
 
+macOS 可以用 Homebrew 安装常用依赖：
+
+```bash
+brew install kubectl fzf
+```
+
+如果需要使用 `kt connect` 菜单，还需要额外安装 `ktctl`。
+
 ## 安装
 
 可以在仓库目录里直接运行：
@@ -27,7 +35,7 @@ container，然后执行对应的 `kubectl` 命令。
 也可以把当前目录加入 `PATH`：
 
 ```bash
-export PATH="/home/ts/projects/tools/kt-tools:$PATH"
+export PATH="$(pwd):$PATH"
 ```
 
 之后直接运行：
@@ -49,7 +57,7 @@ kk --help   # 查看帮助
 ```bash
 KUBECTL=/usr/local/bin/kubectl kk
 KTCTL=/usr/local/bin/ktctl kk
-KT_KUBECONFIG=/home/ts/.kube/config kk
+KT_KUBECONFIG="$HOME/.kube/config" kk
 KT_CONNECT_SUDO=0 kk
 FZF=/usr/bin/fzf kk
 ```
@@ -116,7 +124,7 @@ kt connect 菜单：
 - `creams-dp-finance`
 
 执行 `ktctl` 时会显式追加 `--kubeconfig`。默认使用 `KUBECONFIG`；
-如果未设置，则使用 `/home/ts/.kube/config`，避免 `sudo ktctl connect`
+如果未设置，则使用 `$HOME/.kube/config`，避免 `sudo ktctl connect`
 时丢失普通用户的 kubeconfig。
 
 `ktctl connect` 通常需要配置本机网络路由，默认会以 `sudo ktctl ... connect`
