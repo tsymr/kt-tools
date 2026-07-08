@@ -109,7 +109,7 @@ namespace 选择，从 container 选择返回到 Pod 选择。
 
 kt connect 菜单：
 
-- `connect`：后台启动本地到集群的网络隧道，启动后默认打开日志
+- `connect`：后台启动本地到集群的网络隧道，启动后默认打印日志
 - `connect foreground`：前台启动网络隧道，占用当前终端
 - `show connect log`：查看后台 connect 日志快照，按 `q` 返回
 - `stop connect`：停止后台 connect 进程
@@ -128,9 +128,9 @@ kt connect 菜单：
 时丢失普通用户的 kubeconfig。
 
 `ktctl connect` 通常需要配置本机网络路由，默认会以 `sudo ktctl ... connect`
-后台执行，并把 PID 和日志放在 `/tmp`。启动后会默认打开日志跟随页；按 `q`
-退出日志页后，可以继续在同一个 `kk` 菜单里选择 `exchange` 或 `mesh`。后台进程会尽量用独立会话启动，避免
-你在日志页按 `Ctrl+C` 时误停掉 connect。
+后台执行，并把 PID 和日志放在 `/tmp`。启动后会默认打印最近 200 行 connect
+日志快照；按 Enter 后，可以继续在同一个 `kk` 菜单里选择 `exchange` 或 `mesh`。
+后台进程会尽量用独立会话启动，避免你在日志页按 `Ctrl+C` 时误停掉 connect。
 
 如果你明确不需要 sudo，可以设置：
 
