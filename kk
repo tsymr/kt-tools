@@ -440,7 +440,8 @@ choose_kt_namespace() {
 
 choose_kt_mode() {
   fzf_select_described "kt mode" \
-    $'connect\t后台启动网络隧道，启动后打印日志' \
+    $'connect\t后台启动网络隧道，启动后实时查看日志' \
+    $'follow connect log\t实时查看后台 connect 日志' \
     $'connect foreground\t前台启动网络隧道，占用当前终端' \
     $'show connect log\t查看后台 connect 日志快照，按 q 返回' \
     $'stop connect\t停止后台 connect 进程' \
@@ -555,9 +556,62 @@ run_kt_connect_foreground() {
   run_command high "${cmd[@]}"
 }
 
+start_detached_command() {
+  local log_file="$1"
+  local launcher
+  shift
+
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" >"$log_file" 2>&1 < /dev/null &
+    printf '%s\n' "$!"
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    launcher=python3
+  elif command -v python >/dev/null 2>&1; then
+    launcher=python
+  else
+    printf 'kk: missing required command: setsid or python3/python for detached background process\n' >&2
+    return 1
+  fi
+
+  "$launcher" -c '
+import os
+import sys
+
+log_file = sys.argv[1]
+cmd = sys.argv[2:]
+if not cmd:
+    sys.exit("missing command")
+
+pid = os.fork()
+if pid:
+    print(pid)
+    sys.exit(0)
+
+os.setsid()
+devnull_fd = os.open(os.devnull, os.O_RDONLY)
+log_fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+os.dup2(devnull_fd, 0)
+os.dup2(log_fd, 1)
+os.dup2(log_fd, 2)
+if devnull_fd > 2:
+    os.close(devnull_fd)
+if log_fd > 2:
+    os.close(log_fd)
+
+try:
+    os.execvp(cmd[0], cmd)
+except Exception as exc:
+    os.write(2, ("failed to exec command: %s\n" % exc).encode())
+    os._exit(127)
+' "$log_file" "$@"
+}
+
 run_kt_connect_background() {
   local namespace="$1"
-  local pid_file log_file pid
+  local pid_file log_file pid status
   local -a cmd
 
   pid_file=$(kt_connect_pid_file "$namespace")
@@ -574,7 +628,6 @@ run_kt_connect_background() {
   fi
 
   require_cmd "$KTCTL_BIN"
-  require_cmd nohup
   if [[ "$KT_CONNECT_SUDO" != "0" ]]; then
     require_cmd sudo
     printf '\nRefreshing sudo credentials for background ktctl connect...\n'
@@ -591,15 +644,9 @@ run_kt_connect_background() {
   fi
 
   # Keep background ktctl out of this terminal's Ctrl+C signal path.
-  if command -v setsid >/dev/null 2>&1; then
-    setsid nohup "${cmd[@]}" >"$log_file" 2>&1 < /dev/null &
-  else
-    (
-      trap '' INT HUP
-      exec nohup "${cmd[@]}" >"$log_file" 2>&1 < /dev/null
-    ) &
-  fi
-  pid=$!
+  pid=$(start_detached_command "$log_file" "${cmd[@]}")
+  status=$?
+  (( status == 0 )) || return "$status"
   printf '%s\n' "$pid" >"$pid_file"
   disown "$pid" 2>/dev/null || true
 
@@ -625,27 +672,41 @@ show_kt_connect_log() {
   fi
 }
 
-print_kt_connect_log() {
+follow_kt_connect_log() {
   local namespace="$1"
-  local log_file attempt
+  local log_file attempt status
 
   log_file=$(kt_connect_log_file "$namespace")
   for attempt in {1..10}; do
-    [[ -s "$log_file" ]] && break
+    [[ -f "$log_file" ]] && break
     sleep 0.2
   done
 
-  printf '\nktctl connect log snapshot:\n  %s\n\n' "$log_file"
   if [[ ! -f "$log_file" ]]; then
     printf 'No ktctl connect log found for namespace %s.\n' "$namespace" >&2
+    printf 'Expected log: %s\n' "$log_file" >&2
     return 1
   fi
-  if [[ ! -s "$log_file" ]]; then
-    printf '(log is empty; ktctl may still be starting)\n'
-    return 0
-  fi
 
-  tail -n 200 "$log_file"
+  printf '\nFollowing ktctl connect log.\n'
+  printf 'Press Ctrl+C to stop following, then q to quit.\n'
+  printf 'Log: %s\n' "$log_file"
+
+  if command -v less >/dev/null 2>&1; then
+    less -R +F "$log_file"
+    status=$?
+  else
+    tail -n 200 -f "$log_file"
+    status=$?
+  fi
+  SKIP_PAUSE=1
+
+  case "$status" in
+    0|130|141|143) return 0 ;;
+  esac
+
+  printf '\nLog viewer exited with status %d.\n' "$status" >&2
+  return "$status"
 }
 
 stop_kt_connect() {
@@ -1047,13 +1108,17 @@ kt_connect_menu() {
           status=$?
           (( PRINT_ONLY )) && return "$status"
           if (( status == 0 )); then
-            print_kt_connect_log "$namespace"
+            follow_kt_connect_log "$namespace"
             status=$?
-            if (( status == 0 )); then
-              pause_if_interactive
-              continue
-            fi
+            (( status == 0 )) && continue
           fi
+          return "$status"
+          ;;
+        "follow connect log")
+          follow_kt_connect_log "$namespace"
+          status=$?
+          (( PRINT_ONLY )) && return "$status"
+          (( status == 0 )) && continue
           return "$status"
           ;;
         "connect foreground")
