@@ -440,7 +440,7 @@ choose_kt_namespace() {
 
 choose_kt_mode() {
   fzf_select_described "kt mode" \
-    $'connect\t后台启动网络隧道，启动后返回此菜单' \
+    $'connect\t后台启动网络隧道，启动后打开日志' \
     $'connect foreground\t前台启动网络隧道，占用当前终端' \
     $'show connect log\t查看后台 connect 日志快照，按 q 返回' \
     $'stop connect\t停止后台 connect 进程' \
@@ -623,6 +623,36 @@ show_kt_connect_log() {
   else
     tail -n 200 "$log_file"
   fi
+}
+
+follow_kt_connect_log() {
+  local namespace="$1"
+  local log_file status
+
+  log_file=$(kt_connect_log_file "$namespace")
+  if [[ ! -f "$log_file" ]]; then
+    printf 'No ktctl connect log found for namespace %s.\n' "$namespace" >&2
+    printf 'Expected log: %s\n' "$log_file" >&2
+    return 1
+  fi
+
+  printf '\nFollowing ktctl connect log. Press Ctrl+C to stop following, q to quit.\n'
+  printf 'Log: %s\n' "$log_file"
+
+  if command -v less >/dev/null 2>&1; then
+    less -R +F "$log_file"
+    status=$?
+    SKIP_PAUSE=1
+    return "$status"
+  fi
+
+  tail -n 200 -f "$log_file"
+  status=$?
+  SKIP_PAUSE=1
+  if (( status == 130 )); then
+    return 0
+  fi
+  return "$status"
 }
 
 stop_kt_connect() {
@@ -1023,7 +1053,11 @@ kt_connect_menu() {
           run_kt_connect_background "$namespace"
           status=$?
           (( PRINT_ONLY )) && return "$status"
-          (( status == 0 )) && continue
+          if (( status == 0 )); then
+            follow_kt_connect_log "$namespace"
+            status=$?
+            (( status == 0 )) && continue
+          fi
           return "$status"
           ;;
         "connect foreground")
